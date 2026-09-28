@@ -227,6 +227,9 @@ def test_cache_asset_streams_slow_package_transfers(monkeypatch, tmp_path):
     class ProbeStream(httpx.AsyncByteStream):
         async def __aiter__(self):
             observed["target_exists_when_stream_starts"] = target.exists()
+            observed["partial_files_when_stream_starts"] = len(
+                list(tmp_path.glob(".asset.*.part"))
+            )
             yield b"package-bytes"
 
     async def handler(request):
@@ -252,11 +255,54 @@ def test_cache_asset_streams_slow_package_transfers(monkeypatch, tmp_path):
 
     assert observed == {
         "method": "GET",
-        "target_exists_when_stream_starts": True,
+        "partial_files_when_stream_starts": 1,
+        "target_exists_when_stream_starts": False,
         "timeout": 60.0,
         "url": "https://example.test/pkg.conda",
     }
     assert target.read_bytes() == b"package-bytes"
+    assert list(tmp_path.glob(".asset.*.part")) == []
+
+
+@pytest.mark.parametrize("existing_bytes", [None, b"existing-valid-package"])
+def test_cache_asset_cleans_partial_download(
+    monkeypatch, tmp_path, existing_bytes
+):
+    target = tmp_path / "asset"
+    if existing_bytes is not None:
+        target.write_bytes(existing_bytes)
+
+    class InterruptedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"partial-package"
+            raise httpx.ReadTimeout("injected interrupted transfer")
+
+    async def handler(request):
+        return httpx.Response(200, stream=InterruptedStream())
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*, timeout):
+        return real_async_client(
+            timeout=timeout,
+            transport=httpx.MockTransport(handler),
+        )
+
+    monkeypatch.setattr(
+        "snakemake_software_deployment_plugin_conda.httpx.AsyncClient", client_factory
+    )
+    env = SimpleNamespace(
+        _cache_assets={"asset": SimpleNamespace(url="https://example.test/pkg.conda")}
+    )
+
+    with pytest.raises(httpx.ReadTimeout, match="injected interrupted transfer"):
+        asyncio.run(Env.cache_asset(env, "asset", target))
+
+    if existing_bytes is None:
+        assert not target.exists()
+    else:
+        assert target.read_bytes() == existing_bytes
+    assert list(tmp_path.glob(".asset.*.part")) == []
 
 
 def test_httpx_client_supports_socks_proxy():
